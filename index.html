@@ -1,3 +1,4 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Diet Plan</title>
@@ -107,7 +108,11 @@ section.view { display: flex; flex-direction: column; gap: 14px; padding-top: 14
 .filters { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 2px }
 .filters button { border: 1px solid var(--line); background: var(--surface); border-radius: 999px; padding: 6px 12px; font-size: .84rem; font-weight: 700; white-space: nowrap }
 .filters button[aria-pressed="true"] { background: var(--ink); color: var(--bg); border-color: var(--ink) }
-input[type="search"], input[type="number"], input[type="date"], textarea { width: 100%; border: 1px solid var(--line); background: var(--surface); border-radius: var(--r-sm); padding: 10px 12px; min-height: 44px }
+.warn-text { color: var(--warn) }
+input[type="text"], input[type="password"], input[type="search"], input[type="number"], input[type="date"], textarea { width: 100%; border: 1px solid var(--line); background: var(--surface); border-radius: var(--r-sm); padding: 10px 12px; min-height: 44px }
+input[type="number"], input[type="date"] { display: block; height: 46px; min-width: 0; max-width: 100%; -webkit-appearance: none; appearance: none; text-align: left; line-height: normal }
+input[type="date"]::-webkit-date-and-time-value { text-align: left; margin: 0 }   /* iOS Safari centres the date and forces a min width */
+input[type="date"]::-webkit-calendar-picker-indicator { margin-left: auto }
 
 /* sheet (recipe / swap overlay) */
 .sheet { position: fixed; inset: 0; z-index: 20; background: var(--bg); overflow-y: auto; -webkit-overflow-scrolling: touch;
@@ -140,7 +145,7 @@ ul.tips { margin: 0; padding-left: 18px; display: flex; flex-direction: column; 
 .chart .pt { fill: var(--accent); }
 .chart .today { stroke: var(--warn); stroke-width: 1.5; stroke-dasharray: 2 3 }
 .chart .cp { fill: var(--surface); stroke: var(--target); stroke-width: 2 }
-.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px }
+.form-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px }
 .form-grid label { display: flex; flex-direction: column; gap: 4px; font-size: .84rem; font-weight: 700; color: var(--muted); min-width: 0 }
 table.wk { width: 100%; border-collapse: collapse; font-size: .88rem }
 table.wk th { text-align: left; font-size: .72rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); padding: 6px 4px }
@@ -201,7 +206,110 @@ if (S.planVer !== DATA.planVer && oldDef) { for (const d of DAYS) for (let i = 0
 S.planDefault = JSON.parse(JSON.stringify(DATA.plan)); S.planVer = DATA.planVer;
 S.weights = S.weights || [{ d: IN.startDate, kg: IN.start, note: "Start" }];
 let saveOk = true;
-function save() { try { localStorage.setItem(KEY, JSON.stringify(S)); saveOk = true; } catch (e) { saveOk = false; } }
+function save() { try { localStorage.setItem(KEY, JSON.stringify(S)); saveOk = true; } catch (e) { saveOk = false; } syncSoon(); }
+
+/* ---------- sync across devices: one JSON file in the user's own PRIVATE GitHub repo ----------
+   Same mechanism as the TDM Insights tab (GitHub contents API: GET for content + sha, PUT with the sha,
+   retry on conflict, debounced saves, local copy first) - but the token is typed in once per device
+   and kept only in that device's localStorage. It is never written into this page or into any repo. */
+const SYNC_KEY = KEY + ".sync", SYNC_FILE = "diet-plan-data.json", GH_API = "https://api.github.com";
+const ON_PAGES = /\.github\.io$/i.test(location.hostname);
+const CAN_SYNC = ON_PAGES || location.protocol === "file:";
+const DEFAULT_REPO = (ON_PAGES ? location.hostname.split(".")[0] : "your-username") + "/diet-data";
+let syncTimer = null, syncBusy = false, syncAgain = false, syncState = { msg: "", err: false };
+function syncCfg() { try { return JSON.parse(localStorage.getItem(SYNC_KEY)) || {}; } catch (e) { return {}; } }
+function setSyncCfg(c) { try { localStorage.setItem(SYNC_KEY, JSON.stringify(c)); } catch (e) {} }
+function setSyncMsg(msg, err) {
+  syncState = { msg, err: !!err };
+  const el = document.getElementById("sync-status");
+  if (el) { el.textContent = msg; el.className = "small " + (err ? "warn-text" : "muted"); }
+}
+const ghUrl = c => GH_API + "/repos/" + c.repo + "/contents/" + SYNC_FILE;
+const ghHeaders = c => ({ "Authorization": "Bearer " + c.token, "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" });
+const b64enc = t => btoa(unescape(encodeURIComponent(t)));
+const b64dec = t => decodeURIComponent(escape(atob(String(t).replace(/\n/g, ""))));
+function ghError(st) {
+  if (st === 401) return "The token is wrong or has expired - disconnect and paste a new one.";
+  if (st === 403) return "The token can't write to that repo - it needs Contents: Read and write.";
+  if (st === 404) return "Repo not found - check the name, and that the token was given access to it.";
+  return "GitHub error " + st + " - your data is safe on this device; try again later.";
+}
+async function ghGet(c) {
+  const r = await fetch(ghUrl(c), { headers: ghHeaders(c), cache: "no-store" });
+  if (r.status === 404) {   // file not created yet, or the repo isn't reachable with this token?
+    const rr = await fetch(GH_API + "/repos/" + c.repo, { headers: ghHeaders(c), cache: "no-store" });
+    if (rr.ok) return { data: null, sha: "" };
+    throw { status: rr.status };
+  }
+  if (!r.ok) throw { status: r.status };
+  const j = await r.json();
+  return { data: JSON.parse(b64dec(j.content)), sha: j.sha };
+}
+async function ghPut(c, obj, sha) {
+  const body = { message: "Update diet plan data", content: b64enc(JSON.stringify(obj, null, 1)) };
+  if (sha) body.sha = sha;
+  const r = await fetch(ghUrl(c), { method: "PUT", headers: Object.assign({ "Content-Type": "application/json" }, ghHeaders(c)), body: JSON.stringify(body) });
+  if (!r.ok) throw { status: r.status };
+}
+function canon(o) {
+  if (Array.isArray(o)) return "[" + o.map(canon).join(",") + "]";
+  if (o && typeof o === "object") return "{" + Object.keys(o).sort().map(k => JSON.stringify(k) + ":" + canon(o[k])).join(",") + "}";
+  return JSON.stringify(o);
+}
+function syncable(st) {
+  return { v: 1, plan: st.plan, planU: st.planU || 0, ticks: st.ticks || {}, ticksU: st.ticksU || 0,
+           weights: [...(st.weights || [])].sort((a, b) => a.d < b.d ? -1 : a.d > b.d ? 1 : 0) };
+}
+// Newest change wins for the meal plan and for the shopping ticks; weigh-ins merge per date
+// (the newest edit or delete for each date wins), so two devices never wipe each other's entries.
+function mergeIn(st, remote) {
+  if (!remote) return false;
+  let changed = false;
+  if (remote.plan && (remote.planU || 0) > (st.planU || 0)) { st.plan = remote.plan; st.planU = remote.planU; changed = true; }
+  if ((remote.ticksU || 0) > (st.ticksU || 0)) { st.ticks = remote.ticks || {}; st.ticksU = remote.ticksU; changed = true; }
+  const by = {};
+  for (const w of (st.weights || [])) by[w.d] = w;
+  for (const w of (remote.weights || [])) {
+    const cur = by[w.d];
+    if (!cur || (w.u || 0) > (cur.u || 0)) { if (!cur || canon(cur) !== canon(w)) changed = true; by[w.d] = w; }
+  }
+  st.weights = Object.values(by);
+  return changed;
+}
+async function syncNow(manual, tries) {
+  const c = syncCfg();
+  if (!CAN_SYNC || !c.token || !c.repo) return;
+  if (syncBusy) { syncAgain = true; return; }
+  syncBusy = true; setSyncMsg("Syncing...");
+  try {
+    const { data, sha } = await ghGet(c);
+    if (mergeIn(S, data)) { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {} rerender(); }
+    if (!data || canon(syncable(S)) !== canon(syncable(data))) {
+      try { await ghPut(c, syncable(S), sha); }
+      catch (e) {
+        if ((e.status === 409 || e.status === 422) && (tries || 0) < 3) { syncBusy = false; return syncNow(manual, (tries || 0) + 1); }
+        throw e;
+      }
+    }
+    setSyncMsg("Synced " + new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }));
+    if (manual) toast("Synced");
+  } catch (e) {
+    setSyncMsg(e && e.status ? ghError(e.status) : "No connection - saved on this device, it will sync later.", true);
+    if (manual) toast("Sync didn't work - see the Sync card");
+  }
+  syncBusy = false;
+  if (syncAgain) { syncAgain = false; syncNow(); }
+}
+function syncSoon() {
+  const c = syncCfg(); if (!CAN_SYNC || !c.token) return;
+  clearTimeout(syncTimer); syncTimer = setTimeout(() => syncNow(), 1200);
+}
+function rerender() {
+  renderStrip();
+  const cur = document.querySelector('nav.tabs button[aria-current="page"]'); const t = cur ? cur.dataset.tab : "today";
+  ({ today: renderToday, week: renderWeek, recipes: renderRecipes, shop: renderShop, weight: renderWeight })[t]();
+}
+
 
 /* ---------- maths ---------- */
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -242,7 +350,7 @@ let selDay = todayName;
 /* ---------- shell ---------- */
 const $ = s => document.querySelector(s);
 function toast(msg) { const t = $("#toast"); t.textContent = msg; t.hidden = false; clearTimeout(toast._t); toast._t = setTimeout(() => t.hidden = true, 1800); }
-function weightsSorted() { return [...S.weights].sort((a, b) => a.d < b.d ? -1 : 1); }
+function weightsSorted() { return S.weights.filter(w => !w.del).sort((a, b) => a.d < b.d ? -1 : 1); }
 function avg7(iso) { const ws = weightsSorted().filter(w => dayDiff(w.d, iso) >= 0 && dayDiff(w.d, iso) < 7); return ws.length ? ws.reduce((s, w) => s + w.kg, 0) / ws.length : null; }
 function renderStrip() {
   const ws = weightsSorted(); const last = ws[ws.length - 1];
@@ -276,7 +384,7 @@ function renderToday() {
     </article>`; }).join("");
   const x = M.X1;
   $("#v-today").innerHTML = `
-    <div class="row between"><div class="row"><h1>${selDay === todayName ? "Today" : selDay}</h1>${isOffice(selDay) ? '<span class="chip acc">Office day</span>' : ""}</div><span class="muted small">${selDay === todayName ? new Date().toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long" }) : "Plan for " + selDay}</span></div>
+    <div class="row between"><div class="row"><h1>${selDay === todayName ? "Today" : selDay}</h1>${isOffice(selDay) ? '<span class="chip acc">Office day</span>' : ""}</div><span class="muted small">${selDay === todayName ? new Date().toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long" }) : ""}</span></div>
     <div class="days" role="group" aria-label="Pick a day">${dayChips}</div>
     <p class="small muted">${isOffice(selDay) ? "Office day: breakfast, lunch and snack all travel in a box. Pack them the night before; dinner is at home." : "Dot = office day (" + OFFICE.map(d => d.slice(0, 3)).join(", ") + ") \u2013 those days only use packable meals."}</p>
     <div class="card stack">
@@ -314,7 +422,7 @@ function openSwap(day, i) {
       <div class="r num"><div class="t">${fmt(m.kcal)}</div><div class="s">${fmt(m.p)} g P \u00b7 ${fmt(m.cost)} K\u010d</div></div></button>`; }).join("");
   openSheet(`<div class="bar-top"><button class="btn" data-close>Close</button><div><div class="eyebrow">${day} \u00b7 ${slot}</div><h2>Swap meal</h2></div></div>
     <div class="inner"><p class="small muted">${AIM[slot]}. Calories and the shopping list update straight away.</p><div class="list">${rows}</div></div>`,
-    sh => sh.querySelectorAll("[data-pick]").forEach(b => b.onclick = () => { S.plan[day][i] = b.dataset.pick; save(); closeSheet(); renderToday(); toast(saveOk ? "Swapped" : "Swapped \u2013 not saved on this device"); }));
+    sh => sh.querySelectorAll("[data-pick]").forEach(b => b.onclick = () => { S.plan[day][i] = b.dataset.pick; S.planU = Date.now(); save(); closeSheet(); renderToday(); toast(saveOk ? "Swapped" : "Swapped \u2013 not saved on this device"); }));
 }
 function openRecipe(id) {
   const r = R[id], m = M[id];
@@ -356,7 +464,7 @@ function renderWeek() {
     <div id="reset-zone">${confirmReset ? `<div class="confirm">Put every day back to the original plan?<button class="btn" id="reset-yes">Reset</button><button class="btn ghost" id="reset-no">Keep my changes</button></div>` : `<button class="btn ghost" id="reset">Reset to the original plan</button>`}</div>`;
   $("#v-week").querySelectorAll("[data-goday]").forEach(b => b.onclick = () => { selDay = b.dataset.goday; showTab("today"); });
   const r0 = $("#reset"); if (r0) r0.onclick = () => { confirmReset = true; renderWeek(); };
-  const ry = $("#reset-yes"); if (ry) ry.onclick = () => { S.plan = JSON.parse(JSON.stringify(DATA.plan)); save(); confirmReset = false; renderWeek(); toast("Plan reset"); };
+  const ry = $("#reset-yes"); if (ry) ry.onclick = () => { S.plan = JSON.parse(JSON.stringify(DATA.plan)); S.planU = Date.now(); save(); confirmReset = false; renderWeek(); toast("Plan reset"); };
   const rn = $("#reset-no"); if (rn) rn.onclick = () => { confirmReset = false; renderWeek(); };
 }
 
@@ -443,9 +551,9 @@ function renderShop() {
     ${(DATA.pantry || []).length ? `<div class="card stack"><h3>Pantry basics</h3><p class="small muted">Buy once \u2013 not in the totals above. Typical prices, not researched.</p><div class="tbl-wrap"><table class="eo-table"><tbody>${DATA.pantry.map(p => `<tr><td style="font-weight:700">${esc(p[0])}</td><td>${esc(p[1])}</td><td class="muted">${esc(p[2])}</td></tr>`).join("")}</tbody></table></div></div>` : ""}
     <div id="clear-zone">${confirmClear ? `<div class="confirm">Untick everything?<button class="btn" id="clr-yes">Untick all</button><button class="btn ghost" id="clr-no">Cancel</button></div>` : `<button class="btn ghost" id="clr">Untick everything for next week</button>`}</div>`;
   const v = $("#v-shop");
-  v.querySelectorAll("[data-tick]").forEach(cb => cb.onchange = () => { if (cb.checked) S.ticks[cb.dataset.tick] = true; else delete S.ticks[cb.dataset.tick]; save(); renderShop(); });
+  v.querySelectorAll("[data-tick]").forEach(cb => cb.onchange = () => { if (cb.checked) S.ticks[cb.dataset.tick] = true; else delete S.ticks[cb.dataset.tick]; S.ticksU = Date.now(); save(); renderShop(); });
   const c0 = $("#clr"); if (c0) c0.onclick = () => { confirmClear = true; renderShop(); };
-  const cy = $("#clr-yes"); if (cy) cy.onclick = () => { S.ticks = {}; save(); confirmClear = false; renderShop(); toast("All unticked"); };
+  const cy = $("#clr-yes"); if (cy) cy.onclick = () => { S.ticks = {}; S.ticksU = Date.now(); save(); confirmClear = false; renderShop(); toast("All unticked"); };
   const cn = $("#clr-no"); if (cn) cn.onclick = () => { confirmClear = false; renderShop(); };
 }
 
@@ -511,27 +619,74 @@ function renderWeight() {
     <div class="card stack"><h3>Weekly check</h3><div class="tbl-wrap"><table class="wk"><thead><tr><th>Wk</th><th>From</th><th>Target</th><th>Avg</th><th>Status</th></tr></thead><tbody>${wk}</tbody></table></div>
       <p class="small muted">Flat for 2 weeks in a row? Cut 150 kcal (drop the snack's fruit or 20 g of rice) or add 2,000 steps a day \u2013 one change at a time.</p></div>
     <div class="stack"><h3>History</h3>${ws.length ? `<div class="list">${hist}</div>` : `<div class="empty">No weigh-ins yet. Add today's weight above.</div>`}</div>
+    ${syncCardHtml()}
     <div class="card stack"><div class="row between"><h3>Backup</h3><button class="btn ghost" id="bk-toggle">${showBackup ? "Hide" : "Show"}</button></div>
-      <p class="small muted">Weigh-ins, ticks and meal swaps are saved in this phone's browser only. Copy a backup now and then; paste it here to restore on another device.</p>
+      <p class="small muted">Weigh-ins, ticks and meal swaps are always saved in this browser${syncCfg().token ? " and synced to GitHub" : ""}. You can also copy a backup and paste it here to restore.</p>
       ${showBackup ? `<div class="row"><button class="btn" id="bk-copy">Copy backup</button><button class="btn" id="bk-restore">Restore from pasted text</button></div><textarea id="bk-text" rows="4" placeholder="Paste a backup here"></textarea>` : ""}</div>`;
   const v = $("#v-weight");
   $("#wform").onsubmit = e => { e.preventDefault(); const kg = parseFloat(String($("#w-kg").value).replace(",", "."));
     if (!(kg > 40 && kg < 200)) { toast("Enter your weight in kg, e.g. 81.4"); return; }
     const d = $("#w-date").value || todayIso; const steps = parseInt($("#w-steps").value, 10);
-    S.weights = S.weights.filter(w => w.d !== d); S.weights.push({ d, kg: Math.round(kg * 10) / 10, ...(steps > 0 ? { steps } : {}) });
+    S.weights = S.weights.filter(w => w.d !== d); S.weights.push({ d, kg: Math.round(kg * 10) / 10, u: Date.now(), ...(steps > 0 ? { steps } : {}) });
     save(); renderWeight(); renderStrip(); toast(saveOk ? "Saved" : "Not saved \u2013 this browser blocks storage"); };
-  v.querySelectorAll("[data-del]").forEach(b => b.onclick = () => { S.weights = S.weights.filter(w => w.d !== b.dataset.del); save(); renderWeight(); renderStrip(); toast("Deleted"); });
+  v.querySelectorAll("[data-del]").forEach(b => b.onclick = () => { S.weights = S.weights.filter(w => w.d !== b.dataset.del); S.weights.push({ d: b.dataset.del, del: true, u: Date.now() }); save(); renderWeight(); renderStrip(); toast("Deleted"); });
   $("#bk-toggle").onclick = () => { showBackup = !showBackup; renderWeight(); };
+  bindSyncCard();
   const bc = $("#bk-copy"); if (bc) bc.onclick = () => { const txt = JSON.stringify(S); const ta = $("#bk-text");
     navigator.clipboard && navigator.clipboard.writeText(txt).then(() => toast("Backup copied"), () => { ta.value = txt; ta.select(); toast("Select all and copy"); }) || (ta.value = txt, ta.select()); };
   const br = $("#bk-restore"); if (br) br.onclick = () => { try { const o = JSON.parse($("#bk-text").value);
-    if (!o.plan || !o.weights) throw 0; S = { plan: o.plan, ticks: o.ticks || {}, weights: o.weights }; save(); renderWeight(); renderStrip(); toast("Restored"); }
+    if (!o.plan || !o.weights) throw 0; S = { plan: o.plan, ticks: o.ticks || {}, weights: o.weights, planU: Date.now(), ticksU: Date.now(), planDefault: S.planDefault, planVer: S.planVer }; save(); renderWeight(); renderStrip(); toast("Restored"); }
     catch (e) { toast("That doesn't look like a backup"); } };
 }
+
+/* ---------- sync card (Weight tab) ---------- */
+function syncCardHtml() {
+  const c = syncCfg();
+  const head = `<div class="row between"><h3>Sync across devices</h3>${c.token ? '<span class="chip good">On</span>' : '<span class="chip">Off</span>'}</div>`;
+  const status = `<p id="sync-status" class="small ${syncState.err ? "warn-text" : "muted"}">${esc(syncState.msg)}</p>`;
+  if (!CAN_SYNC) return `<div class="card stack">${head}<p class="small muted">Sync works on your GitHub Pages copy of this app (yourname.github.io/diet-plan). Here, your data stays on this device.</p></div>`;
+  if (c.token) return `<div class="card stack">${head}
+    <p class="small muted">Saving to your private repo <b>${esc(c.repo)}</b>. Weigh-ins, meal swaps and shopping ticks follow you to every device you connect.</p>
+    ${status}
+    <div class="row"><button class="btn primary" id="sy-now">Sync now</button><button class="btn ghost" id="sy-off">Disconnect this device</button></div></div>`;
+  return `<div class="card stack">${head}
+    <p class="small muted">Keep your data in a private GitHub repo so it follows you between phone and laptop. Without this, everything is saved on this device only.</p>
+    <details><summary class="small" style="color:var(--accent);font-weight:700;cursor:pointer">One-time setup (3 min)</summary>
+      <ol class="small" style="margin:8px 0 0;padding-left:18px;display:flex;flex-direction:column;gap:6px">
+        <li>Create a <b>private</b> repo: github.com/new &rarr; name <b>diet-data</b> &rarr; <b>Private</b> &rarr; tick <b>Add a README file</b> &rarr; Create repository.</li>
+        <li>Create a token: github.com &rarr; your photo &rarr; Settings &rarr; Developer settings &rarr; Personal access tokens &rarr; <b>Fine-grained tokens</b> &rarr; Generate new token. Expiration: 1 year. Repository access: <b>Only select repositories &rarr; diet-data</b>. Permissions: <b>Contents &rarr; Read and write</b>. Generate it and copy it.</li>
+        <li>Paste it below and tap Connect. Do the same on each device. Never put the token in the diet-plan repo or send it to anyone.</li>
+      </ol></details>
+    <label for="sy-repo" class="small muted" style="font-weight:700;display:flex;flex-direction:column;gap:4px">Private repo<input type="text" id="sy-repo" value="${esc(c.repo || DEFAULT_REPO)}" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
+    <label for="sy-token" class="small muted" style="font-weight:700;display:flex;flex-direction:column;gap:4px">Token<input type="password" id="sy-token" placeholder="github_pat_..." autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+    ${status}
+    <button class="btn primary" id="sy-connect">Connect</button></div>`;
+}
+function bindSyncCard() {
+  const cn = $("#sy-connect");
+  if (cn) cn.onclick = async () => {
+    const repo = $("#sy-repo").value.trim().replace(/^https?:\/\/github\.com\//i, "").replace(/\/+$/, "");
+    const token = $("#sy-token").value.trim();
+    if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) { setSyncMsg("Enter the repo as username/repo, e.g. " + DEFAULT_REPO, true); return; }
+    if (token.length < 20) { setSyncMsg("Paste the whole token - it starts with github_pat_", true); return; }
+    setSyncMsg("Checking...");
+    try { await ghGet({ repo, token }); }
+    catch (e) { setSyncMsg(e && e.status ? ghError(e.status) : "No connection - try again.", true); return; }
+    setSyncCfg({ repo, token }); setSyncMsg(""); renderWeight(); await syncNow(true);
+  };
+  const now = $("#sy-now"); if (now) now.onclick = () => syncNow(true);
+  const off = $("#sy-off"); if (off) off.onclick = () => {
+    const c = syncCfg(); setSyncCfg({ repo: c.repo }); syncState = { msg: "", err: false }; renderWeight(); toast("This device is disconnected");
+  };
+}
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") syncNow(); });
 
 /* ---------- boot ---------- */
 renderStrip();
 let startTab = "today"; try { startTab = localStorage.getItem(KEY + ".tab") || "today"; } catch (e) {}
 const hashTab = (location.hash || "").replace("#", ""); if (["today", "week", "recipes", "shop", "weight"].includes(hashTab)) startTab = hashTab;
 showTab(startTab);
+syncNow();
 </script>
+
+</body></html>
