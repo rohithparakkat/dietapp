@@ -365,8 +365,36 @@ function showTab(name) {
   ({ today: renderToday, week: renderWeek, recipes: renderRecipes, shop: renderShop, weight: renderWeight })[name]();
   window.scrollTo(0, 0);
   try { localStorage.setItem(KEY + ".tab", name); } catch (e) {}
+  curTab = name;
 }
-document.querySelectorAll("nav.tabs button").forEach(b => b.addEventListener("click", () => showTab(b.dataset.tab)));
+document.querySelectorAll("nav.tabs button").forEach(b => b.addEventListener("click", () => go(b.dataset.tab)));
+
+/* ---------- links: every page has its own address ----------
+   #today #week #recipes #shop #weight | #prep #eating-out (Recipes sub-pages) | #recipe-L3 | #monday ... #sunday */
+const TABS = ["today", "week", "recipes", "shop", "weight"];
+let curTab = null, lastRoute = null, sheetPushed = false;
+function setHash(h, push) {
+  if ("#" + h === location.hash) return;
+  try { history[push ? "pushState" : "replaceState"](null, "", "#" + h); } catch (e) { try { location.replace("#" + h); } catch (_) {} }
+}
+function go(h) { setHash(h, true); route(); }
+function route() {
+  lastRoute = location.hash;
+  const h = decodeURIComponent(location.hash.slice(1)), lh = h.toLowerCase();
+  const before = curTab + "|" + selDay + "|" + recSeg;
+  let tab, recipe = null;
+  if (TABS.includes(lh)) { tab = lh; if (lh === "today") selDay = todayName; if (lh === "recipes") recSeg = "meals"; }
+  else if (lh === "prep" || lh === "eating-out") { tab = "recipes"; recSeg = lh === "prep" ? "prep" : "out"; }
+  else if (lh.startsWith("recipe-") && R[h.slice(7).toUpperCase()]) { recipe = h.slice(7).toUpperCase(); tab = curTab || "recipes"; }
+  else if (DAYS.some(d => d.toLowerCase() === lh)) { tab = "today"; selDay = DAYS.find(d => d.toLowerCase() === lh); }
+  else { tab = curTab || "today"; }
+  const sheetOpen = !$("#sheet").hidden;
+  if (sheetOpen && !recipe) closeSheetUI();
+  if (curTab + "|" + selDay + "|" + recSeg !== before || tab !== curTab || (!sheetOpen && !recipe)) showTab(tab);
+  if (recipe) openRecipe(recipe);
+}
+window.addEventListener("popstate", () => { if (location.hash !== lastRoute) route(); });
+window.addEventListener("hashchange", () => { if (location.hash !== lastRoute) route(); });
 
 /* ---------- Today ---------- */
 function mealMeta(id) { const m = M[id], r = R[id];
@@ -400,16 +428,23 @@ function renderToday() {
     ${meals}
     <div class="drinks"><span>Coffee / tea with 200 ml milk across the day</span><span class="num">${fmt(x.kcal)} kcal \u00b7 ${fmt(x.p)} g</span></div>
     <p class="small muted">Plus 8\u201310k steps and 2.5\u20133 l of water. Without the steps the plan lands at ~75 kg instead of 72 kg.</p>`;
-  $("#v-today").querySelectorAll("[data-day]").forEach(b => b.onclick = () => { selDay = b.dataset.day; renderToday(); });
+  $("#v-today").querySelectorAll("[data-day]").forEach(b => b.onclick = () => { selDay = b.dataset.day; renderToday(); setHash(selDay === todayName ? "today" : selDay.toLowerCase(), false); lastRoute = location.hash; });
   bindRecipeButtons($("#v-today"));
   $("#v-today").querySelectorAll("[data-swap]").forEach(b => b.onclick = () => openSwap(selDay, +b.dataset.swap));
 }
-function bindRecipeButtons(root) { root.querySelectorAll("[data-recipe]").forEach(b => b.onclick = () => openRecipe(b.dataset.recipe)); }
+function bindRecipeButtons(root) { root.querySelectorAll("[data-recipe]").forEach(b => b.onclick = () => { sheetPushed = true; go("recipe-" + b.dataset.recipe); }); }
 
 /* ---------- sheet: swap & recipe ---------- */
 function openSheet(html, onBind) { const sh = $("#sheet"); sh.innerHTML = html; sh.hidden = false; sh.scrollTop = 0; document.body.style.overflow = "hidden";
   sh.querySelector("[data-close]").onclick = closeSheet; if (onBind) onBind(sh); }
-function closeSheet() { const sh = $("#sheet"); sh.hidden = true; sh.innerHTML = ""; document.body.style.overflow = ""; }
+function closeSheetUI() { const sh = $("#sheet"); sh.hidden = true; sh.innerHTML = ""; document.body.style.overflow = ""; }
+function closeSheet() {
+  if (/^#recipe-/i.test(location.hash)) {
+    if (sheetPushed) { sheetPushed = false; history.back(); return; }
+    setHash(curTab || "recipes", false); lastRoute = location.hash;
+  }
+  closeSheetUI();
+}
 document.addEventListener("keydown", e => { if (e.key === "Escape" && !$("#sheet").hidden) closeSheet(); });
 function optionsFor(slot) { const ids = DATA.order.filter(id => R[id].type === slot); if (slot === "Lunch" || slot === "Dinner") ids.push("F1"); return ids; }
 function openSwap(day, i) {
@@ -462,7 +497,7 @@ function renderWeek() {
     <div class="list">${rows}</div>
     <div class="stack"><h3>Rules that matter most</h3><ul class="tips small">${DATA.rules.map(r => `<li>${esc(r.replace(/^\u2022\s*/, ""))}</li>`).join("")}</ul></div>
     <div id="reset-zone">${confirmReset ? `<div class="confirm">Put every day back to the original plan?<button class="btn" id="reset-yes">Reset</button><button class="btn ghost" id="reset-no">Keep my changes</button></div>` : `<button class="btn ghost" id="reset">Reset to the original plan</button>`}</div>`;
-  $("#v-week").querySelectorAll("[data-goday]").forEach(b => b.onclick = () => { selDay = b.dataset.goday; showTab("today"); });
+  $("#v-week").querySelectorAll("[data-goday]").forEach(b => b.onclick = () => go(b.dataset.goday === todayName ? "today" : b.dataset.goday.toLowerCase()));
   const r0 = $("#reset"); if (r0) r0.onclick = () => { confirmReset = true; renderWeek(); };
   const ry = $("#reset-yes"); if (ry) ry.onclick = () => { S.plan = JSON.parse(JSON.stringify(DATA.plan)); S.planU = Date.now(); save(); confirmReset = false; renderWeek(); toast("Plan reset"); };
   const rn = $("#reset-no"); if (rn) rn.onclick = () => { confirmReset = false; renderWeek(); };
@@ -501,7 +536,7 @@ function renderRecipes() {
   }
   $("#v-recipes").innerHTML = `<h1>Recipes</h1><div class="seg" role="group" aria-label="Recipe sections">${segs}</div>${body}`;
   const v = $("#v-recipes");
-  v.querySelectorAll("[data-seg]").forEach(b => b.onclick = () => { recSeg = b.dataset.seg; renderRecipes(); });
+  v.querySelectorAll("[data-seg]").forEach(b => b.onclick = () => go({ meals: "recipes", prep: "prep", out: "eating-out" }[b.dataset.seg]));
   v.querySelectorAll("[data-f]").forEach(b => b.onclick = () => { recFilter = b.dataset.f; renderRecipes(); });
   const rq = $("#rq"); if (rq) rq.oninput = e => { recQuery = e.target.value; const pos = e.target.selectionStart; renderRecipes(); const n = $("#rq"); n.focus(); n.setSelectionRange(pos, pos); };
   bindRecipeButtons(v);
@@ -684,8 +719,8 @@ document.addEventListener("visibilitychange", () => { if (document.visibilitySta
 /* ---------- boot ---------- */
 renderStrip();
 let startTab = "today"; try { startTab = localStorage.getItem(KEY + ".tab") || "today"; } catch (e) {}
-const hashTab = (location.hash || "").replace("#", ""); if (["today", "week", "recipes", "shop", "weight"].includes(hashTab)) startTab = hashTab;
-showTab(startTab);
+if (!location.hash) setHash(TABS.includes(startTab) ? startTab : "today", false);
+route();
 syncNow();
 </script>
 
