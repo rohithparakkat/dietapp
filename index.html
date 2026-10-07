@@ -590,7 +590,11 @@ function openPlans(first) {
       if (allPlans().length) toast("Your plans are loaded \u2013 tap + Add on yours");
     };
     $("#pl-done").onclick = () => {
-      if (!S.active) return;
+      if (!S.active) {   // ticked (e.g. brought in by sync) but not switched on yet
+        const pick = S.selected.find(id => planById(id));
+        if (!pick) { toast("Tap + Add on a plan first"); return; }
+        useConfig(pick);
+      }
       sheetPushed = false; setHash(curTab || "today", false); lastRoute = location.hash; closeSheetUI(); renderStrip(); showTab(curTab || "today");
       if (S.selected.length > 1) toast("Use the bar at the top to switch person or see Everyone");
     };
