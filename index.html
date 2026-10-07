@@ -512,10 +512,11 @@ function useConfig(id) {
   if (!S.selected.includes(id)) { S.selected.push(id); S.selectedU = Date.now(); }
   seedStart(); save(); applyProfile(); renderStrip();
 }
+function weighInsOf(id) { const d = id === S.active ? S : (S.cfgData[id] || {}); return (d.weights || []).filter(w => !w.del).length; }
 function planLine(c) {
-  const t = computeTargets(c);
+  const t = computeTargets(c), n = weighInsOf(c.id);
   return `${c.sex === "male" ? "Male" : "Female"} \u00b7 ${c.age} \u00b7 ${c.height} cm \u00b7 ${fmt(c.weight, 1)} \u2192 ${fmt(c.goal, 1)} kg<br>
-    <b>${fmt(t.kcal)} kcal</b> a day \u00b7 <b>${t.protein} g</b> protein \u00b7 goal ~${parseD(t.goalDate).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" })}`;
+    <b>${fmt(t.kcal)} kcal</b> a day \u00b7 <b>${t.protein} g</b> protein \u00b7 goal ~${parseD(t.goalDate).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" })} \u00b7 ${n} weigh-in${n === 1 ? "" : "s"}`;
 }
 let confirmDelPlan = null;
 function openPlans(first) {
@@ -527,11 +528,24 @@ function openPlans(first) {
         ${c.preset ? `<button class="btn ghost" data-copy="${c.id}">Copy &amp; edit</button>` : `<button class="btn ghost" data-edit="${c.id}">Edit</button><button class="btn ghost" data-delplan="${c.id}">Delete</button>`}</div>
       ${confirmDelPlan === c.id ? `<div class="confirm">Delete \u201c${esc(c.name)}\u201d and its weigh-ins?<button class="btn" data-delyes="${c.id}">Delete</button><button class="btn ghost" data-delno="1">Keep it</button></div>` : ""}
     </div>`).join("");
-  const n = S.selected.length;
+  const n = S.selected.length, sc = syncCfg();
+  const names = {}; list.forEach(c => { const k = c.name.trim().toLowerCase(); names[k] = (names[k] || 0) + 1; });
+  const dupes = Object.keys(names).filter(k => names[k] > 1);
+  const dupeHint = dupes.length ? `<p class="small warn-text">You have more than one plan with the same name. Keep the one with your weigh-ins and delete the other \u2013 the delete also reaches your other devices through sync.</p>` : "";
+  const syncPanel = !CAN_SYNC ? "" : sc.token
+    ? `<div class="card stack"><div class="row between"><h3>Sync</h3><span class="chip good">On</span></div><p class="small muted">Plans from your other devices and browsers appear here automatically (repo <b>${esc(sc.repo)}</b>).</p><p id="sync-status" class="small ${syncState.err ? "warn-text" : "muted"}">${esc(syncState.msg)}</p><button class="btn" id="pl-sync-now">Sync now</button></div>`
+    : `<div class="card stack"><div class="row between"><h3>Already use this app on another device or browser?</h3><span class="chip">Sync off</span></div>
+        <p class="small muted">Each browser keeps its own data. Connect sync here <b>before</b> creating a plan, and your plans and weigh-ins load from your private repo.</p>
+        <label for="pl-sy-repo" class="small muted" style="font-weight:700;display:flex;flex-direction:column;gap:4px">Private repo<input type="text" id="pl-sy-repo" value="${esc(sc.repo || DEFAULT_REPO)}" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
+        <label for="pl-sy-token" class="small muted" style="font-weight:700;display:flex;flex-direction:column;gap:4px">Token<input type="password" id="pl-sy-token" placeholder="github_pat_..." autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+        <p id="sync-status" class="small ${syncState.err ? "warn-text" : "muted"}">${esc(syncState.msg)}</p>
+        <button class="btn" id="pl-sy-connect">Connect and load my plans</button></div>`;
   const html = `<div class="bar-top"><button class="btn" data-close ${first ? "hidden" : ""}>Close</button><div><div class="eyebrow">${first ? "Welcome" : "Plans"}</div><h2>Who are you cooking for?</h2></div></div>
     <div class="inner"><p class="small muted">Pick one plan, or several if you cook for more than one person. Each plan sizes every recipe, portion and the shopping list to that person and keeps their own weigh-ins. With more than one, the bar at the top switches between each person and <b>Everyone</b>.</p>
-    ${list.length ? cards : `<div class="empty">No plans yet. Create yours below.</div>`}
+    ${dupeHint}
+    ${list.length ? cards : `<div class="empty">No plans yet. Create yours below${CAN_SYNC && !sc.token ? " \u2013 or connect sync first if you already made one on another device" : ""}.</div>`}
     <div class="row"><button class="btn primary" id="pl-done" ${n ? "" : "disabled"}>${n ? (n > 1 ? "Done \u2013 cooking for " + n : "Done") : "Pick a plan first"}</button><button class="btn" id="pl-new">+ Create a new plan</button></div>
+    ${syncPanel}
     <p class="small muted">Plans are saved on this device, and in your private sync repo if sync is on.</p></div>`;
   openSheet(html, sh => {
     sh.querySelectorAll("[data-sel]").forEach(b => b.onclick = () => {
@@ -565,6 +579,16 @@ function openPlans(first) {
       save(); renderStrip(); openPlans(!S.active); toast("Plan deleted");
     });
     $("#pl-new").onclick = () => { sheetPushed = true; go("setup"); };
+    const sn = $("#pl-sync-now"); if (sn) sn.onclick = async () => { await syncNow(true); openPlans(first); };
+    const cn = $("#pl-sy-connect"); if (cn) cn.onclick = async () => {
+      const repo = $("#pl-sy-repo").value.trim().replace(/^https?:\/\/github\.com\//i, "").replace(/\/+$/, ""), token = $("#pl-sy-token").value.trim();
+      if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) { setSyncMsg("Enter the repo as username/repo, e.g. " + DEFAULT_REPO, true); return; }
+      if (token.length < 20) { setSyncMsg("Paste the whole token \u2013 it starts with github_pat_", true); return; }
+      setSyncMsg("Checking...");
+      try { await ghGet({ repo, token }); } catch (e) { setSyncMsg(e && e.status ? ghError(e.status) : "No connection \u2013 try again.", true); return; }
+      setSyncCfg({ repo, token }); await syncNow(true); openPlans(first);
+      if (allPlans().length) toast("Your plans are loaded \u2013 tap + Add on yours");
+    };
     $("#pl-done").onclick = () => {
       if (!S.active) return;
       sheetPushed = false; setHash(curTab || "today", false); lastRoute = location.hash; closeSheetUI(); renderStrip(); showTab(curTab || "today");
